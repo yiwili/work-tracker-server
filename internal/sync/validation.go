@@ -88,7 +88,7 @@ func validateWorkItem(f map[string]any, isCreate bool) error {
 
 	if v, ok := f["status"]; ok && v != nil {
 		s, ok := v.(string)
-		valid := map[string]bool{"requested": true, "attempted": true, "changed": true, "verified": true, "delivered": true}
+		valid := map[string]bool{"requested": true, "attempted": true, "changed": true, "verified": true, "delivered": true, "rejected": true}
 		if !ok || !valid[s] {
 			return fmt.Errorf("invalid status '%v'", v)
 		}
