@@ -209,6 +209,26 @@ func (s *Service) Push(ctx context.Context, accountID, deviceID uuid.UUID, ops [
 				continue
 			}
 
+			if op.EntityType == TypeGiteeLink {
+				wiID, _ := op.Fields["work_item_id"].(string)
+				if wiID != "" {
+					wi, err := s.GetEntity(ctx, tx, accountID, string(TypeWorkItem), wiID)
+					if err != nil {
+						return err
+					}
+					if wi == nil {
+						res := SyncOpResult{
+							OpID:   op.OpID,
+							Status: "rejected",
+							Error:  &OpError{Code: "work_item_not_found", Message: fmt.Sprintf("referenced work item '%s' not found", wiID)},
+						}
+						s.storeOpResult(ctx, tx, accountID, op.OpID, res)
+						results = append(results, res)
+						continue
+					}
+				}
+			}
+
 			// 3. Check existing entity
 			current, err := s.GetEntity(ctx, tx, accountID, string(op.EntityType), op.EntityID)
 			if err != nil {
@@ -533,13 +553,15 @@ func (s *Service) Pull(ctx context.Context, accountID uuid.UUID, cursor int64, l
 	var maxCursor = cursor
 
 	for _, ref := range refs {
+		ent, err := s.GetEntity(ctx, s.pool, accountID, ref.entityType, ref.entityID)
+		if err != nil {
+			return PullResponse{}, fmt.Errorf("read pulled entity (%s, %s): %w", ref.entityType, ref.entityID, err)
+		}
+		if ent == nil {
+			continue
+		}
 		if ref.seq > maxCursor {
 			maxCursor = ref.seq
-		}
-
-		ent, err := s.GetEntity(ctx, s.pool, accountID, ref.entityType, ref.entityID)
-		if err != nil || ent == nil {
-			continue
 		}
 		entities = append(entities, *ent)
 	}

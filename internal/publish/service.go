@@ -46,6 +46,45 @@ func LinkEntityID(workItemID, targetScope string) string {
 	return "lnk_" + hex.EncodeToString(h[:16])
 }
 
+func isSameBatchContent(input RegisterBatchInput, b PublishBatch) bool {
+	if input.Executor != b.Executor {
+		return false
+	}
+	if len(input.Items) != len(b.Requests) {
+		return false
+	}
+	reqMap := make(map[string]PublishRequest, len(b.Requests))
+	for _, r := range b.Requests {
+		key := r.WorkItemID + "|" + r.TargetScope
+		reqMap[key] = r
+	}
+
+	for _, it := range input.Items {
+		key := it.WorkItemID + "|" + it.TargetScope
+		req, ok := reqMap[key]
+		if !ok {
+			return false
+		}
+		if req.WorkItemVersion != it.WorkItemVersion {
+			return false
+		}
+		if req.Operation != it.Operation && !req.OperationAdjusted {
+			return false
+		}
+		itPayload, _ := json.Marshal(it.Payload)
+		reqPayload, _ := json.Marshal(req.Payload)
+		if string(itPayload) != string(reqPayload) {
+			return false
+		}
+		itTarget, _ := json.Marshal(it.Target)
+		reqTarget, _ := json.Marshal(req.Target)
+		if string(itTarget) != string(reqTarget) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Service) RegisterBatch(ctx context.Context, accountID, deviceID uuid.UUID, input RegisterBatchInput) (PublishBatch, int, error) {
 	if len(input.Items) == 0 || len(input.Items) > 200 {
 		return PublishBatch{}, 0, httpx.E(http.StatusBadRequest, "validation_failed", "items must contain 1..200 requests")
@@ -73,12 +112,15 @@ func (s *Service) RegisterBatch(ctx context.Context, accountID, deviceID uuid.UU
 		`, accountID, input.IdempotencyKey).Scan(&existingID, &existingCreated)
 
 		if err == nil {
-			// Found existing batch: return it
-			statusCode = http.StatusOK
+			// Found existing batch: verify content
 			b, err := s.getBatchInTx(ctx, tx, accountID, existingID)
 			if err != nil {
 				return err
 			}
+			if !isSameBatchContent(input, b) {
+				return httpx.E(http.StatusConflict, "idempotency_conflict", "batch exists with different payload")
+			}
+			statusCode = http.StatusOK
 			batch = b
 			return nil
 		}
@@ -103,7 +145,19 @@ func (s *Service) RegisterBatch(ctx context.Context, accountID, deviceID uuid.UU
 		// 4. Validate items & preview freshness
 		batchID := uuid.New()
 		expiresAt := now.Add(s.cfg.PublishPreviewTTL)
-		var requests []PublishRequest
+
+		type preparedRequest struct {
+			reqID       uuid.UUID
+			item        PublishItemInput
+			op          string
+			opAdjusted  bool
+			remoteID    string
+			targetJSON  []byte
+			payloadJSON []byte
+			cfgVersJSON []byte
+		}
+
+		var prepared []preparedRequest
 
 		for _, item := range input.Items {
 			// Check work item exists, not deleted, version matches
@@ -163,6 +217,30 @@ func (s *Service) RegisterBatch(ctx context.Context, accountID, deviceID uuid.UU
 			payloadJSON, _ := json.Marshal(item.Payload)
 			cfgVersJSON, _ := json.Marshal(item.ConfigVersions)
 
+			prepared = append(prepared, preparedRequest{
+				reqID:       reqID,
+				item:        item,
+				op:          op,
+				opAdjusted:  opAdjusted,
+				remoteID:    remoteID,
+				targetJSON:  targetJSON,
+				payloadJSON: payloadJSON,
+				cfgVersJSON: cfgVersJSON,
+			})
+		}
+
+		// 5. Insert publish_batches FIRST! (Fixes SQLSTATE 23503 foreign key violation)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO publish_batches (id, account_id, idempotency_key, executor, created_by_device, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`, batchID, accountID, input.IdempotencyKey, input.Executor, deviceID, now)
+		if err != nil {
+			return fmt.Errorf("insert batch: %w", err)
+		}
+
+		// 6. Insert publish_requests SECOND!
+		var requests []PublishRequest
+		for _, p := range prepared {
 			_, err = tx.Exec(ctx, `
 				INSERT INTO publish_requests (
 					id, account_id, batch_id, work_item_id, work_item_version, target_scope,
@@ -170,46 +248,37 @@ func (s *Service) RegisterBatch(ctx context.Context, accountID, deviceID uuid.UU
 					config_versions, executor, state, expires_at, created_at, updated_at
 				)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
-			`, reqID, accountID, batchID, item.WorkItemID, item.WorkItemVersion, item.TargetScope,
-				op, opAdjusted, remoteID, "", targetJSON, payloadJSON,
-				cfgVersJSON, input.Executor, StateRegistered, expiresAt, now)
+			`, p.reqID, accountID, batchID, p.item.WorkItemID, p.item.WorkItemVersion, p.item.TargetScope,
+				p.op, p.opAdjusted, p.remoteID, "", p.targetJSON, p.payloadJSON,
+				p.cfgVersJSON, input.Executor, StateRegistered, expiresAt, now)
 
 			if err != nil {
 				var pgErr *pgconn.PgError
 				if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-					return httpx.E(http.StatusConflict, "in_flight", fmt.Sprintf("work item '%s' already has a publication in progress for target '%s'", item.WorkItemID, item.TargetScope))
+					return httpx.E(http.StatusConflict, "in_flight", fmt.Sprintf("work item '%s' already has a publication in progress for target '%s'", p.item.WorkItemID, p.item.TargetScope))
 				}
 				return fmt.Errorf("insert publish request: %w", err)
 			}
 
 			requests = append(requests, PublishRequest{
-				ID:                reqID,
+				ID:                p.reqID,
 				BatchID:           &batchID,
-				WorkItemID:        item.WorkItemID,
-				WorkItemVersion:   item.WorkItemVersion,
-				TargetScope:       item.TargetScope,
-				Operation:         op,
-				OperationAdjusted: opAdjusted,
-				RemoteID:          remoteID,
+				WorkItemID:        p.item.WorkItemID,
+				WorkItemVersion:   p.item.WorkItemVersion,
+				TargetScope:       p.item.TargetScope,
+				Operation:         p.op,
+				OperationAdjusted: p.opAdjusted,
+				RemoteID:          p.remoteID,
 				URL:               "",
-				Target:            item.Target,
-				Payload:           item.Payload,
-				ConfigVersions:    item.ConfigVersions,
+				Target:            p.item.Target,
+				Payload:           p.item.Payload,
+				ConfigVersions:    p.item.ConfigVersions,
 				Executor:          input.Executor,
 				State:             StateRegistered,
 				ExpiresAt:         &expiresAt,
 				CreatedAt:         now,
 				UpdatedAt:         now,
 			})
-		}
-
-		// Insert batch
-		_, err = tx.Exec(ctx, `
-			INSERT INTO publish_batches (id, account_id, idempotency_key, executor, created_by_device, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-		`, batchID, accountID, input.IdempotencyKey, input.Executor, deviceID, now)
-		if err != nil {
-			return fmt.Errorf("insert batch: %w", err)
 		}
 
 		batch = PublishBatch{
@@ -339,14 +408,14 @@ func (s *Service) Claim(ctx context.Context, accountID, deviceID, requestID uuid
 	var r PublishRequest
 	var targetJSON, payloadJSON, cfgJSON []byte
 
-	// 1. Try atomic claim
+	// 1. Try atomic claim (only device executor tasks can be claimed by devices)
 	err := s.pool.QueryRow(ctx, `
 		UPDATE publish_requests
 		SET state = 'sending',
 		    executor_device_id = $1,
 		    claimed_at = $2,
 		    updated_at = $2
-		WHERE id = $3 AND account_id = $4 AND state = 'registered' AND expires_at > $2
+		WHERE id = $3 AND account_id = $4 AND state = 'registered' AND expires_at > $2 AND executor = 'device'
 		RETURNING id, batch_id, work_item_id, work_item_version, target_scope, operation, operation_adjusted,
 		          remote_id, url, target, payload, config_versions, executor, executor_device_id, state,
 		          error, note, published_version, expires_at, claimed_at, finished_at, created_at, updated_at
@@ -389,6 +458,10 @@ func (s *Service) Claim(ctx context.Context, accountID, deviceID, requestID uuid
 	_ = json.Unmarshal(payloadJSON, &r.Payload)
 	_ = json.Unmarshal(cfgJSON, &r.ConfigVersions)
 
+	if r.Executor != "device" {
+		return PublishRequest{}, httpx.E(http.StatusForbidden, "invalid_executor", "cannot claim request assigned to cloud executor")
+	}
+
 	// Idempotent retry by the same device
 	if r.State == StateSending && r.ExecutorDeviceID != nil && *r.ExecutorDeviceID == deviceID {
 		return r, nil
@@ -411,16 +484,10 @@ func (s *Service) ReportResult(ctx context.Context, accountID, deviceID, request
 			return err
 		}
 
-		reqs, err := s.listRequestsInTx(ctx, tx, accountID, nil, "", "", 1)
-		if err != nil {
-			return err
-		}
-		_ = reqs
-
 		// Read current
 		var cur PublishRequest
 		var targetJSON, payloadJSON, cfgJSON []byte
-		err = tx.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			SELECT id, batch_id, work_item_id, work_item_version, target_scope, operation, operation_adjusted,
 			       remote_id, url, target, payload, config_versions, executor, executor_device_id, state,
 			       error, note, published_version, expires_at, claimed_at, finished_at, created_at, updated_at
@@ -557,7 +624,7 @@ func (s *Service) Reconcile(ctx context.Context, accountID, deviceID, requestID 
 			return httpx.E(http.StatusConflict, "invalid_state", fmt.Sprintf("cannot reconcile request in state '%s'", cur.State))
 		}
 
-		newState := StateFailed
+		newState := StateUncertain
 		var pubVer *int64
 
 		if input.Found {
@@ -580,6 +647,8 @@ func (s *Service) Reconcile(ctx context.Context, accountID, deviceID, requestID 
 			if err != nil {
 				return err
 			}
+		} else if input.ProvenNotCreated {
+			newState = StateFailed
 		}
 
 		err = tx.QueryRow(ctx, `
@@ -740,17 +809,17 @@ func (s *Service) ImportLinks(ctx context.Context, accountID, deviceID uuid.UUID
 	}, nil
 }
 
-func (s *Service) MigrationStatus(ctx context.Context, accountID uuid.UUID) (MigrationStatus, error) {
+func (s *Service) migrationStatusInTx(ctx context.Context, tx pgx.Tx, accountID uuid.UUID) (MigrationStatus, error) {
 	var enabled bool
-	err := s.pool.QueryRow(ctx, "SELECT unified_publish_enabled FROM accounts WHERE id = $1", accountID).Scan(&enabled)
+	err := tx.QueryRow(ctx, "SELECT unified_publish_enabled FROM accounts WHERE id = $1", accountID).Scan(&enabled)
 	if err != nil {
 		return MigrationStatus{}, err
 	}
 
 	var workItems, links, uncertain int
-	_ = s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM sync_entities WHERE account_id = $1 AND entity_type = 'work_item' AND deleted = false", accountID).Scan(&workItems)
-	_ = s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM sync_entities WHERE account_id = $1 AND entity_type = 'gitee_link' AND deleted = false", accountID).Scan(&links)
-	_ = s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM publish_requests WHERE account_id = $1 AND state = 'uncertain'", accountID).Scan(&uncertain)
+	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM sync_entities WHERE account_id = $1 AND entity_type = 'work_item' AND deleted = false", accountID).Scan(&workItems)
+	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM sync_entities WHERE account_id = $1 AND entity_type = 'gitee_link' AND deleted = false", accountID).Scan(&links)
+	_ = tx.QueryRow(ctx, "SELECT COUNT(*) FROM publish_requests WHERE account_id = $1 AND state = 'uncertain'", accountID).Scan(&uncertain)
 
 	return MigrationStatus{
 		UnifiedPublishEnabled: enabled,
@@ -762,26 +831,52 @@ func (s *Service) MigrationStatus(ctx context.Context, accountID uuid.UUID) (Mig
 	}, nil
 }
 
+func (s *Service) MigrationStatus(ctx context.Context, accountID uuid.UUID) (MigrationStatus, error) {
+	var status MigrationStatus
+	err := db.InTx(ctx, s.pool, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, func(tx pgx.Tx) error {
+		st, err := s.migrationStatusInTx(ctx, tx, accountID)
+		if err != nil {
+			return err
+		}
+		status = st
+		return nil
+	})
+	return status, err
+}
+
 func (s *Service) CompleteMigration(ctx context.Context, accountID uuid.UUID, expected MigrationCounts) (MigrationStatus, error) {
-	status, err := s.MigrationStatus(ctx, accountID)
+	var status MigrationStatus
+	err := db.InTx(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		if err := s.entityStore.LockAccount(ctx, tx, accountID); err != nil {
+			return err
+		}
+
+		st, err := s.migrationStatusInTx(ctx, tx, accountID)
+		if err != nil {
+			return err
+		}
+
+		if st.Counts.WorkItems != expected.WorkItems ||
+			st.Counts.Links != expected.Links ||
+			st.Counts.Uncertain != expected.Uncertain {
+			return httpx.E(http.StatusConflict, "count_mismatch", fmt.Sprintf(
+				"migration count mismatch: expected %+v, actual %+v", expected, st.Counts,
+			))
+		}
+
+		_, err = tx.Exec(ctx, "UPDATE accounts SET unified_publish_enabled = true WHERE id = $1", accountID)
+		if err != nil {
+			return err
+		}
+
+		st.UnifiedPublishEnabled = true
+		status = st
+		return nil
+	})
 	if err != nil {
 		return MigrationStatus{}, err
 	}
 
-	if status.Counts.WorkItems != expected.WorkItems ||
-		status.Counts.Links != expected.Links ||
-		status.Counts.Uncertain != expected.Uncertain {
-		return status, httpx.E(http.StatusConflict, "count_mismatch", fmt.Sprintf(
-			"migration count mismatch: expected %+v, actual %+v", expected, status.Counts,
-		))
-	}
-
-	_, err = s.pool.Exec(ctx, "UPDATE accounts SET unified_publish_enabled = true WHERE id = $1", accountID)
-	if err != nil {
-		return MigrationStatus{}, err
-	}
-
-	status.UnifiedPublishEnabled = true
 	return status, nil
 }
 

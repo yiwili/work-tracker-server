@@ -24,6 +24,46 @@ func TestValidationRules(t *testing.T) {
 	}, true)
 	require.Error(t, err)
 
+	// Whitespace-only title
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"date":  "2026-11-06",
+		"title": "   \t  ",
+	}, true)
+	require.Error(t, err)
+
+	// Invalid calendar date 2026-02-31
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"date":  "2026-02-31",
+		"title": "Valid title",
+	}, true)
+	require.Error(t, err)
+
+	// Fractional confirmed_minutes (e.g. 12.75)
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"date":              "2026-11-06",
+		"title":             "Valid title",
+		"confirmed_minutes": 12.75,
+	}, false)
+	require.Error(t, err)
+
+	// Out of range confirmed_minutes
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"confirmed_minutes": 1500,
+	}, false)
+	require.Error(t, err)
+
+	// Non-boolean time_locked
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"time_locked": "true",
+	}, false)
+	require.Error(t, err)
+
+	// Non-boolean deleted
+	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
+		"deleted": 1,
+	}, false)
+	require.Error(t, err)
+
 	// Unknown field
 	err = sync.ValidateFields(sync.TypeWorkItem, map[string]any{
 		"date":    "2026-11-06",
@@ -37,6 +77,21 @@ func TestValidationRules(t *testing.T) {
 		"target_minutes": 480,
 	}, true)
 	require.NoError(t, err)
+
+	// GiteeLink validation
+	err = sync.ValidateFields(sync.TypeGiteeLink, map[string]any{
+		"work_item_id": "wi-123",
+		"target_scope": "ent:100",
+		"remote_id":    "issue-1",
+	}, true)
+	require.NoError(t, err)
+
+	// GiteeLink missing remote_id on create
+	err = sync.ValidateFields(sync.TypeGiteeLink, map[string]any{
+		"work_item_id": "wi-123",
+		"target_scope": "ent:100",
+	}, true)
+	require.Error(t, err)
 }
 
 func TestSyncPushAndConflict(t *testing.T) {

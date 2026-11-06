@@ -87,9 +87,10 @@ type ResultInput struct {
 }
 
 type ReconcileInput struct {
-	Found    bool   `json:"found"`
-	RemoteID string `json:"remote_id"`
-	URL      string `json:"url"`
+	Found            bool   `json:"found"`
+	RemoteID         string `json:"remote_id"`
+	URL              string `json:"url"`
+	ProvenNotCreated bool   `json:"proven_not_created,omitempty"`
 }
 
 type MigrationCounts struct {
