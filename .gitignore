@@ -1,0 +1,6 @@
+﻿bin/
+*.exe
+*.test
+coverage.out
+.env
+deploy/.env

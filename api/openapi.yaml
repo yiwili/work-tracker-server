@@ -1,0 +1,722 @@
+openapi: 3.0.3
+info:
+  title: Work Tracker Server API
+  version: 1.0.0
+  description: |
+    Multi-device sync and Gitee publish coordination for AI Work Tracker.
+    Behaviour is specified in docs/protocol.md. All /api/v1 endpoints except auth/register,
+    auth/login and health require `Authorization: Bearer <token>`.
+servers:
+  - url: /api/v1
+security:
+  - bearer: []
+tags:
+  - name: auth
+  - name: sync
+  - name: publish
+  - name: migration
+paths:
+  /health:
+    get:
+      tags: [auth]
+      security: []
+      summary: Liveness and database readiness
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, database]
+                properties:
+                  status: { type: string, example: ok }
+                  database: { type: string, example: ok }
+                  version: { type: string }
+        '503': { $ref: '#/components/responses/Error' }
+
+  /auth/register:
+    post:
+      tags: [auth]
+      security: []
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: { type: string, format: email, maxLength: 320 }
+                password: { type: string, minLength: 8, maxLength: 128 }
+                display_name: { type: string, maxLength: 100 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+
+  /auth/login:
+    post:
+      tags: [auth]
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, device]
+              additionalProperties: false
+              properties:
+                email: { type: string, maxLength: 320 }
+                password: { type: string, maxLength: 128 }
+                device: { $ref: '#/components/schemas/DeviceInput' }
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      responses:
+        '204': { description: Current session revoked }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /me:
+    get:
+      tags: [auth]
+      operationId: me
+      responses:
+        '200':
+          description: Current account and device
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [account, device]
+                properties:
+                  account: { $ref: '#/components/schemas/Account' }
+                  device: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /devices:
+    get:
+      tags: [auth]
+      operationId: listDevices
+      responses:
+        '200':
+          description: Devices of the account (including revoked)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /devices/{device_id}:
+    delete:
+      tags: [auth]
+      operationId: revokeDevice
+      parameters:
+        - { name: device_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Revoked (idempotent) }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /sync/push:
+    post:
+      tags: [sync]
+      operationId: syncPush
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              additionalProperties: false
+              properties:
+                ops:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: { $ref: '#/components/schemas/SyncOp' }
+      responses:
+        '200':
+          description: Per-op results in request order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results, cursor]
+                properties:
+                  results:
+                    type: array
+                    items: { $ref: '#/components/schemas/SyncOpResult' }
+                  cursor: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+
+  /sync/pull:
+    get:
+      tags: [sync]
+      operationId: syncPull
+      parameters:
+        - { name: cursor, in: query, required: true, schema: { type: integer, format: int64, minimum: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 500 } }
+      responses:
+        '200':
+          description: Changed entities (current state) after cursor
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [changes, cursor, has_more]
+                properties:
+                  changes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entity' }
+                  cursor: { type: integer, format: int64 }
+                  has_more: { type: boolean }
+        '401': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
+
+  /sync/snapshot:
+    get:
+      tags: [sync]
+      operationId: syncSnapshot
+      responses:
+        '200':
+          description: Consistent full snapshot of the account
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entities, cursor]
+                properties:
+                  entities:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entity' }
+                  cursor: { type: integer, format: int64 }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /entities/{entity_type}:
+    get:
+      tags: [sync]
+      operationId: listEntities
+      parameters:
+        - $ref: '#/components/parameters/EntityType'
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: include_deleted, in: query, schema: { type: boolean, default: false } }
+      responses:
+        '200':
+          description: Entities of the type (date filter applies to work_item and daily_report)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entities, cursor]
+                properties:
+                  entities:
+                    type: array
+                    items: { $ref: '#/components/schemas/Entity' }
+                  cursor: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /entities/{entity_type}/{entity_id}:
+    get:
+      tags: [sync]
+      operationId: getEntity
+      parameters:
+        - $ref: '#/components/parameters/EntityType'
+        - { name: entity_id, in: path, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$' } }
+      responses:
+        '200':
+          description: Entity
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entity' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /publish/batches:
+    post:
+      tags: [publish]
+      operationId: registerPublishBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idempotency_key, executor, items]
+              additionalProperties: false
+              properties:
+                idempotency_key: { type: string, minLength: 8, maxLength: 128 }
+                executor: { type: string, enum: [device, cloud] }
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: { $ref: '#/components/schemas/PublishItemInput' }
+      responses:
+        '200':
+          description: Existing batch for this idempotency key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishBatch' }
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishBatch' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /publish/batches/{batch_id}:
+    get:
+      tags: [publish]
+      operationId: getPublishBatch
+      parameters:
+        - { name: batch_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Batch
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishBatch' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /publish/requests:
+    get:
+      tags: [publish]
+      operationId: listPublishRequests
+      parameters:
+        - { name: state, in: query, schema: { $ref: '#/components/schemas/PublishState' } }
+        - { name: work_item_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        '200':
+          description: Requests, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requests]
+                properties:
+                  requests:
+                    type: array
+                    items: { $ref: '#/components/schemas/PublishRequest' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /publish/requests/{request_id}/claim:
+    post:
+      tags: [publish]
+      operationId: claimPublishRequest
+      parameters: [ { $ref: '#/components/parameters/RequestId' } ]
+      responses:
+        '200':
+          description: Now sending, owned by the calling device
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishRequest' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '410': { $ref: '#/components/responses/Error' }
+
+  /publish/requests/{request_id}/result:
+    post:
+      tags: [publish]
+      operationId: reportPublishResult
+      parameters: [ { $ref: '#/components/parameters/RequestId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              additionalProperties: false
+              properties:
+                outcome: { type: string, enum: [succeeded, failed, uncertain] }
+                remote_id: { type: string, maxLength: 100 }
+                url: { type: string, maxLength: 2000 }
+                error: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: Updated request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishRequest' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /publish/requests/{request_id}/reconcile:
+    post:
+      tags: [publish]
+      operationId: reconcilePublishRequest
+      parameters: [ { $ref: '#/components/parameters/RequestId' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [found]
+              additionalProperties: false
+              properties:
+                found: { type: boolean }
+                remote_id: { type: string, maxLength: 100 }
+                url: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: Updated request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishRequest' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /publish/requests/{request_id}/cancel:
+    post:
+      tags: [publish]
+      operationId: cancelPublishRequest
+      parameters: [ { $ref: '#/components/parameters/RequestId' } ]
+      responses:
+        '200':
+          description: Cancelled request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishRequest' }
+        '401': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /migration/links:
+    post:
+      tags: [migration]
+      operationId: importLinks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                links:
+                  type: array
+                  maxItems: 1000
+                  items:
+                    type: object
+                    required: [work_item_id, target_scope, remote_id]
+                    additionalProperties: false
+                    properties:
+                      work_item_id: { type: string }
+                      target_scope: { $ref: '#/components/schemas/TargetScope' }
+                      remote_id: { type: string, maxLength: 100 }
+                      url: { type: string, maxLength: 2000 }
+                      published_at: { type: string, format: date-time }
+                pending:
+                  type: array
+                  maxItems: 1000
+                  items:
+                    type: object
+                    required: [work_item_id, target_scope]
+                    additionalProperties: false
+                    properties:
+                      work_item_id: { type: string }
+                      target_scope: { $ref: '#/components/schemas/TargetScope' }
+                      note: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: Import summary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [links_upserted, links_unchanged, pending_created, pending_skipped, conflicts]
+                properties:
+                  links_upserted: { type: integer }
+                  links_unchanged: { type: integer }
+                  pending_created: { type: integer }
+                  pending_skipped: { type: integer }
+                  conflicts:
+                    type: array
+                    items:
+                      type: object
+                      required: [work_item_id, target_scope, existing_remote_id, remote_id]
+                      properties:
+                        work_item_id: { type: string }
+                        target_scope: { type: string }
+                        existing_remote_id: { type: string }
+                        remote_id: { type: string }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /migration/status:
+    get:
+      tags: [migration]
+      operationId: migrationStatus
+      responses:
+        '200':
+          description: Migration status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MigrationStatus' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /migration/complete:
+    post:
+      tags: [migration]
+      operationId: completeMigration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected]
+              additionalProperties: false
+              properties:
+                expected: { $ref: '#/components/schemas/MigrationCounts' }
+      responses:
+        '200':
+          description: Unified publish enabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MigrationStatus' }
+        '401': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+  parameters:
+    EntityType:
+      name: entity_type
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/EntityType' }
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Error envelope
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+    Account:
+      type: object
+      required: [id, email, display_name, unified_publish_enabled, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string }
+        display_name: { type: string }
+        unified_publish_enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    DeviceInput:
+      type: object
+      required: [name, platform]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        platform: { type: string, enum: [desktop, mobile, web] }
+        client_version: { type: string, maxLength: 50 }
+    Device:
+      type: object
+      required: [id, name, platform, client_version, created_at, current]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { type: string, enum: [desktop, mobile, web] }
+        client_version: { type: string }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        last_sync_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        current: { type: boolean, description: true for the device of the calling session }
+    Session:
+      type: object
+      required: [token, account, device]
+      properties:
+        token: { type: string, description: 'wts_ + base64url(32 bytes); shown once' }
+        account: { $ref: '#/components/schemas/Account' }
+        device: { $ref: '#/components/schemas/Device' }
+    EntityType:
+      type: string
+      enum: [work_item, daily_report, setting, project_mapping, gitee_link]
+    TargetScope:
+      type: string
+      pattern: '^(ent:[1-9][0-9]{0,18}|repo:[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100})$'
+    Entity:
+      type: object
+      required: [entity_type, entity_id, version, field_versions, fields, updated_at]
+      properties:
+        entity_type: { $ref: '#/components/schemas/EntityType' }
+        entity_id: { type: string }
+        version: { type: integer, format: int64 }
+        field_versions:
+          type: object
+          additionalProperties: { type: integer, format: int64 }
+        fields:
+          type: object
+          description: Full field map including `deleted`; shapes per docs/protocol.md §2
+          additionalProperties: true
+        updated_at: { type: string, format: date-time }
+        updated_by_device: { type: string, format: uuid, nullable: true }
+    SyncOp:
+      type: object
+      required: [op_id, entity_type, entity_id, base_version, fields]
+      additionalProperties: false
+      properties:
+        op_id: { type: string, format: uuid }
+        entity_type: { $ref: '#/components/schemas/EntityType' }
+        entity_id: { type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$' }
+        base_version: { type: integer, format: int64, minimum: 0 }
+        fields:
+          type: object
+          additionalProperties: true
+    SyncOpResult:
+      type: object
+      required: [op_id, status]
+      properties:
+        op_id: { type: string, format: uuid }
+        status: { type: string, enum: [applied, conflict, rejected] }
+        entity: { $ref: '#/components/schemas/Entity' }
+        conflict_fields:
+          type: array
+          items: { type: string }
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+    PublishState:
+      type: string
+      enum: [registered, sending, succeeded, failed, uncertain, expired, cancelled]
+    PublishItemInput:
+      type: object
+      required: [work_item_id, work_item_version, target_scope, operation, payload]
+      additionalProperties: false
+      properties:
+        work_item_id: { type: string, pattern: '^[A-Za-z0-9_.:-]{1,128}$' }
+        work_item_version: { type: integer, format: int64, minimum: 1 }
+        target_scope: { $ref: '#/components/schemas/TargetScope' }
+        operation: { type: string, enum: [create, update] }
+        remote_id: { type: string, maxLength: 100 }
+        target:
+          type: object
+          description: 'Executor hints, e.g. {program_id, issue_type_id}'
+          additionalProperties: true
+        payload:
+          type: object
+          description: 'Exact content to send (title, description, minutes, plan_date). ≤64 KiB serialized'
+          additionalProperties: true
+        config_versions:
+          type: object
+          description: 'Map "entity_type:entity_id" -> version used by the preview'
+          additionalProperties: { type: integer, format: int64 }
+    PublishRequest:
+      type: object
+      required: [id, work_item_id, work_item_version, target_scope, operation, operation_adjusted, remote_id, url,
+                 target, payload, config_versions, executor, state, error, note, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        batch_id: { type: string, format: uuid, nullable: true }
+        work_item_id: { type: string }
+        work_item_version: { type: integer, format: int64 }
+        target_scope: { type: string }
+        operation: { type: string, enum: [create, update] }
+        operation_adjusted: { type: boolean }
+        remote_id: { type: string }
+        url: { type: string }
+        target: { type: object, additionalProperties: true }
+        payload: { type: object, additionalProperties: true }
+        config_versions: { type: object, additionalProperties: { type: integer, format: int64 } }
+        executor: { type: string, enum: [device, cloud] }
+        executor_device_id: { type: string, format: uuid, nullable: true }
+        state: { $ref: '#/components/schemas/PublishState' }
+        error: { type: string }
+        note: { type: string }
+        published_version: { type: integer, format: int64, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+        claimed_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    PublishBatch:
+      type: object
+      required: [id, idempotency_key, executor, created_at, requests]
+      properties:
+        id: { type: string, format: uuid }
+        idempotency_key: { type: string }
+        executor: { type: string, enum: [device, cloud] }
+        created_by_device: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/PublishRequest' }
+    MigrationCounts:
+      type: object
+      required: [work_items, links, uncertain]
+      properties:
+        work_items: { type: integer, minimum: 0 }
+        links: { type: integer, minimum: 0 }
+        uncertain: { type: integer, minimum: 0 }
+    MigrationStatus:
+      type: object
+      required: [unified_publish_enabled, counts]
+      properties:
+        unified_publish_enabled: { type: boolean }
+        counts: { $ref: '#/components/schemas/MigrationCounts' }
