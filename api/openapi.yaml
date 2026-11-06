@@ -522,6 +522,75 @@ paths:
         '401': { $ref: '#/components/responses/Error' }
         '409': { $ref: '#/components/responses/Error' }
 
+
+  /history/import:
+    post:
+      tags: [history]
+      operationId: importHistory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportHistoryInput' }
+      responses:
+        '200':
+          description: Batch import result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImportBatchResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /history:
+    get:
+      tags: [history]
+      operationId: listHistory
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        - name: date_from
+          in: query
+          schema: { type: string, format: date }
+        - name: date_to
+          in: query
+          schema: { type: string, format: date }
+        - name: has_date
+          in: query
+          schema: { type: boolean }
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: source
+          in: query
+          schema: { type: string }
+        - name: q
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Paginated history work items
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoryListResult' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /history/summary:
+    get:
+      tags: [history]
+      operationId: historySummary
+      responses:
+        '200':
+          description: Cloud history summary statistics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistorySummaryResult' }
+        '401': { $ref: '#/components/responses/Error' }
+
 components:
   securitySchemes:
     bearer:
@@ -720,3 +789,72 @@ components:
       properties:
         unified_publish_enabled: { type: boolean }
         counts: { $ref: '#/components/schemas/MigrationCounts' }
+
+    HistoryWorkItem:
+      type: object
+      required: [id, title, details, project, source, source_id, url, imported_at, created_at, updated_at]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        details: { type: string }
+        project: { type: string }
+        work_date: { type: string, format: date, nullable: true }
+        source: { type: string }
+        source_id: { type: string }
+        url: { type: string }
+        imported_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ImportItemInput:
+      type: object
+      required: [id, title]
+      properties:
+        id: { type: string, maxLength: 64 }
+        title: { type: string, maxLength: 500 }
+        details: { type: string }
+        project: { type: string, maxLength: 100 }
+        work_date: { type: string, format: date, nullable: true }
+        source: { type: string, maxLength: 50 }
+        source_id: { type: string, maxLength: 255 }
+        url: { type: string, maxLength: 1000 }
+        imported_at: { type: string, format: date-time, nullable: true }
+    ImportHistoryInput:
+      type: object
+      required: [batch_index, total_batches, items]
+      properties:
+        batch_index: { type: integer, minimum: 0 }
+        total_batches: { type: integer, minimum: 1 }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ImportItemInput' }
+    ImportBatchResult:
+      type: object
+      required: [batch_index, received, inserted, updated, unchanged, failed]
+      properties:
+        batch_index: { type: integer }
+        received: { type: integer }
+        inserted: { type: integer }
+        updated: { type: integer }
+        unchanged: { type: integer }
+        failed: { type: integer }
+    HistoryListResult:
+      type: object
+      required: [total, page, limit, items]
+      properties:
+        total: { type: integer }
+        page: { type: integer }
+        limit: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryWorkItem' }
+    HistorySummaryResult:
+      type: object
+      required: [total_records, missing_date_count, sources]
+      properties:
+        total_records: { type: integer }
+        earliest_date: { type: string, format: date, nullable: true }
+        latest_date: { type: string, format: date, nullable: true }
+        missing_date_count: { type: integer }
+        sources:
+          type: object
+          additionalProperties: { type: integer }

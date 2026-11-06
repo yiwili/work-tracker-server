@@ -13,6 +13,7 @@ import (
 	"github.com/yiwili/work-tracker-server/internal/auth"
 	"github.com/yiwili/work-tracker-server/internal/config"
 	"github.com/yiwili/work-tracker-server/internal/db"
+	"github.com/yiwili/work-tracker-server/internal/history"
 	"github.com/yiwili/work-tracker-server/internal/publish"
 	"github.com/yiwili/work-tracker-server/internal/server"
 	"github.com/yiwili/work-tracker-server/internal/sync"
@@ -54,9 +55,13 @@ func main() {
 	publishSvc := publish.NewService(pool, cfg, syncSvc)
 	publishHandler := publish.NewHandler(publishSvc)
 
+	historySvc := history.NewService(pool)
+	historyHandler := history.NewHandler(historySvc)
+
 	modules := []server.Module{
 		syncHandler,
 		publishHandler,
+		historyHandler,
 	}
 
 	router := server.New(server.Deps{
